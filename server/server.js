@@ -10,18 +10,45 @@ dotenv.config();
 const app = express();
 const PORT = process.env.PORT || 5000;
 
-const CLIENT_URL =
-  process.env.CLIENT_URL || "http://localhost:5173";
+// --------------------------------------------------
+// CORS CONFIGURATION
+// --------------------------------------------------
 
-const GEMINI_MODEL =
-  process.env.GEMINI_MODEL || "gemini-3.8-flash";
+const normalizeOrigin = (url) => url.trim().replace(/\/+$/, "");
 
-app.use(cors({ origin: CLIENT_URL }));
+const allowedOrigins = [
+  "http://localhost:5173",
+  "https://updated-portfolio-81af.vercel.app",
+  ...(process.env.CLIENT_URL || "")
+    .split(",")
+    .map(normalizeOrigin)
+    .filter(Boolean),
+].filter((origin, index, origins) => origins.indexOf(origin) === index);
+
+app.use(
+  cors({
+    origin: (origin, callback) => {
+      if (!origin || allowedOrigins.includes(normalizeOrigin(origin))) {
+        return callback(null, true);
+      }
+
+      console.warn("CORS blocked origin:", origin);
+      return callback(new Error("Origin not allowed by CORS"));
+    },
+    methods: ["GET", "POST", "OPTIONS"],
+    allowedHeaders: ["Content-Type", "Authorization"],
+  })
+);
+
+// Parse JSON request bodies
 app.use(express.json({ limit: "10kb" }));
 
 // --------------------------------------------------
 // GEMINI AI CONFIGURATION
 // --------------------------------------------------
+
+const GEMINI_MODEL =
+  process.env.GEMINI_MODEL || "gemini-2.5-flash";
 
 const ai = process.env.GEMINI_API_KEY
   ? new GoogleGenAI({
@@ -33,11 +60,7 @@ const ai = process.env.GEMINI_API_KEY
 // EMAIL CONFIGURATION
 // --------------------------------------------------
 
-const {
-  SMTP_USER,
-  SMTP_PASS,
-  CONTACT_TO_EMAIL,
-} = process.env;
+const { SMTP_USER, SMTP_PASS, CONTACT_TO_EMAIL } = process.env;
 
 const emailTransporter =
   SMTP_USER && SMTP_PASS
@@ -51,20 +74,28 @@ const emailTransporter =
     : null;
 
 // --------------------------------------------------
-// HEALTH CHECK
+// ROOT ROUTE
 // --------------------------------------------------
 
 app.get("/", (_req, res) => {
-  res.json({
+  res.status(200).json({
     success: true,
     message: "Nihala Portfolio API is running.",
   });
 });
 
+// --------------------------------------------------
+// HEALTH CHECK
+// --------------------------------------------------
+
 app.get("/api/health", (_req, res) => {
-  res.json({
+  res.status(200).json({
     success: true,
     status: "ok",
+    aiConfigured: Boolean(ai),
+    emailConfigured: Boolean(
+      emailTransporter && CONTACT_TO_EMAIL
+    ),
   });
 });
 
@@ -94,9 +125,11 @@ app.post("/api/portfolio/chat", async (req, res) => {
     }
 
     if (!ai) {
+      console.error("GEMINI_API_KEY is not configured.");
+
       return res.status(500).json({
         success: false,
-        error: "Gemini API key is missing from the backend .env file.",
+        error: "The AI service is not configured. Please try again later.",
       });
     }
 
@@ -105,7 +138,6 @@ You are the AI Portfolio Assistant for Nihala,
 an MCA graduate and entry-level web developer.
 
 PORTFOLIO INFORMATION:
-
 - MCA graduate from Vidya Academy of Science and Technology, 2025.
 - MERN Stack training at Luminar in 2026.
 - Six months of MERN Stack internship experience.
@@ -143,9 +175,11 @@ INSTRUCTIONS:
     const reply = interaction.output_text?.trim();
 
     if (!reply) {
+      console.error("Gemini returned an empty response.");
+
       return res.status(502).json({
         success: false,
-        error: "Gemini returned an empty response. Please try again.",
+        error: "The AI returned an empty response. Please try again.",
       });
     }
 
@@ -162,8 +196,8 @@ INSTRUCTIONS:
 
     return res.status(500).json({
       success: false,
-      error: "The AI assistant could not respond.",
-      ...(process.env.NODE_ENV === "development" && {
+      error: "The AI assistant could not respond. Please try again.",
+      ...(process.env.NODE_ENV !== "production" && {
         details: error?.message || "Unknown Gemini API error",
       }),
     });
@@ -193,6 +227,7 @@ app.post("/api/portfolio/contact", async (req, res) => {
     const cleanName = name.trim();
     const cleanEmail = email.trim();
     const cleanMessage = message.trim();
+
     const cleanSubject =
       typeof subject === "string" ? subject.trim() : "";
 
@@ -210,22 +245,25 @@ app.post("/api/portfolio/contact", async (req, res) => {
     ) {
       return res.status(400).json({
         success: false,
-        error: "Please check your name, email address, subject, and message.",
+        error:
+          "Please check your name, email address, subject, and message.",
       });
     }
 
     // Check email configuration
     if (!emailTransporter || !CONTACT_TO_EMAIL) {
-      console.error("Email configuration is incomplete.");
+      console.error(
+        "Email configuration is incomplete. Check SMTP_USER, SMTP_PASS, and CONTACT_TO_EMAIL."
+      );
 
       return res.status(500).json({
         success: false,
-        error: "Email settings are missing from the backend configuration.",
+        error: "Email service is not configured. Please try again later.",
       });
     }
 
     // Send the contact form email
-    await emailTransporter.sendMail({
+    const mailResult = await emailTransporter.sendMail({
       from: `"Nihala Portfolio" <${SMTP_USER}>`,
       to: CONTACT_TO_EMAIL,
       replyTo: cleanEmail,
@@ -244,7 +282,10 @@ app.post("/api/portfolio/contact", async (req, res) => {
       ].join("\n"),
     });
 
-    console.log(`Portfolio contact email sent for ${cleanName}.`);
+    console.log("Portfolio contact email accepted by SMTP:", {
+      messageId: mailResult.messageId,
+      accepted: mailResult.accepted,
+    });
 
     return res.status(200).json({
       success: true,
@@ -254,17 +295,21 @@ app.post("/api/portfolio/contact", async (req, res) => {
     console.error("Contact form email error:", {
       message: error?.message,
       code: error?.code,
+      responseCode: error?.responseCode,
     });
 
     return res.status(500).json({
       success: false,
       error: "Unable to send your message. Please try again.",
+      ...(process.env.NODE_ENV !== "production" && {
+        details: error?.message || "Unknown email error",
+      }),
     });
   }
 });
 
 // --------------------------------------------------
-// HANDLE UNKNOWN API ROUTES
+// HANDLE UNKNOWN ROUTES
 // --------------------------------------------------
 
 app.use((req, res) => {
@@ -281,6 +326,10 @@ app.use((req, res) => {
 app.use((error, _req, res, _next) => {
   console.error("Server error:", error.message);
 
+  if (res.headersSent) {
+    return;
+  }
+
   res.status(500).json({
     success: false,
     error: "An unexpected server error occurred.",
@@ -288,19 +337,23 @@ app.use((error, _req, res, _next) => {
 });
 
 // --------------------------------------------------
-// START SERVER
+// LOCAL DEVELOPMENT / VERCEL EXPORT
 // --------------------------------------------------
 
-app.listen(PORT, () => {
-  console.log(`Portfolio API running at http://localhost:${PORT}`);
-  console.log(`Gemini model configured: ${GEMINI_MODEL}`);
-  console.log(`Gemini API key configured: ${Boolean(ai)}`);
-  console.log(
-    `Email configuration complete: ${Boolean(
-      emailTransporter && CONTACT_TO_EMAIL
-    )}`
-  );
-});
+// Run a local server during development.
+// In production, export the Express app for the
+// Vercel function handler to serve.
+if (process.env.NODE_ENV !== "production") {
+  app.listen(PORT, () => {
+    console.log(`Portfolio API running on port ${PORT}`);
+    console.log(`Gemini model configured: ${GEMINI_MODEL}`);
+    console.log(`Gemini API key configured: ${Boolean(ai)}`);
+    console.log(
+      `Email configuration complete: ${Boolean(
+        emailTransporter && CONTACT_TO_EMAIL
+      )}`
+    );
+  });
+}
 
-// Export the Express app for Vercel
 export default app;
